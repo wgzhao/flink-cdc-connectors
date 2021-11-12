@@ -57,6 +57,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -78,8 +79,53 @@ public class OracleSourceTest extends AbstractTestBase {
 
     private static final Logger LOG = LoggerFactory.getLogger(OracleSourceTest.class);
 
-    private OracleContainer oracleContainer =
+    private final OracleContainer oracleContainer =
             OracleTestUtils.ORACLE_CONTAINER.withLogConsumer(new Slf4jLogConsumer(LOG));
+
+    private static <T> List<T> drain(TestSourceContext<T> sourceContext, int expectedRecordCount)
+            throws Exception {
+        List<T> allRecords = new ArrayList<>();
+        LinkedBlockingQueue<StreamRecord<T>> queue = sourceContext.getCollectedOutputs();
+        while (allRecords.size() < expectedRecordCount) {
+            StreamRecord<T> record = queue.poll(100, TimeUnit.SECONDS);
+            if (record != null) {
+                allRecords.add(record.getValue());
+            } else {
+                throw new RuntimeException(
+                        "Can't receive " + expectedRecordCount + " elements before timeout.");
+            }
+        }
+
+        return allRecords;
+    }
+
+    private static <T> void setupSource(DebeziumSourceFunction<T> source) throws Exception {
+        setupSource(
+                source, false, null, null,
+                true, // enable checkpointing; auto commit should be ignored
+                0, 1);
+    }
+
+    private static <T, S1, S2> void setupSource(
+            DebeziumSourceFunction<T> source,
+            boolean isRestored,
+            ListState<S1> restoredOffsetState,
+            ListState<S2> restoredHistoryState,
+            boolean isCheckpointingEnabled,
+            int subtaskIndex,
+            int totalNumSubtasks)
+            throws Exception {
+
+        // run setup procedure in operator life cycle
+        source.setRuntimeContext(
+                new MockStreamingRuntimeContext(
+                        isCheckpointingEnabled, totalNumSubtasks, subtaskIndex));
+        source.initializeState(
+                new MockFunctionInitializationContext(
+                        isRestored,
+                        new MockOperatorStateStore(restoredOffsetState, restoredHistoryState)));
+        source.open(new Configuration());
+    }
 
     @Before
     public void before() throws Exception {
@@ -377,6 +423,14 @@ public class OracleSourceTest extends AbstractTestBase {
         }
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Public Utilities
+    // ------------------------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------------------------
+    // Utilities
+    // ------------------------------------------------------------------------------------------
+
     @Test
     public void testRecoverFromRenameOperation() throws Exception {
         final TestingListState<byte[]> offsetState = new TestingListState<>();
@@ -567,14 +621,6 @@ public class OracleSourceTest extends AbstractTestBase {
         assertTrue(hasTable);
     }
 
-    // ------------------------------------------------------------------------------------------
-    // Public Utilities
-    // ------------------------------------------------------------------------------------------
-
-    // ------------------------------------------------------------------------------------------
-    // Utilities
-    // ------------------------------------------------------------------------------------------
-
     private DebeziumSourceFunction<SourceRecord> createOracleLogminerSource() {
         return basicSourceBuilder(oracleContainer).build();
     }
@@ -589,23 +635,6 @@ public class OracleSourceTest extends AbstractTestBase {
                 .username(oracleContainer.getUsername())
                 .password(oracleContainer.getPassword())
                 .deserializer(new ForwardDeserializeSchema());
-    }
-
-    private static <T> List<T> drain(TestSourceContext<T> sourceContext, int expectedRecordCount)
-            throws Exception {
-        List<T> allRecords = new ArrayList<>();
-        LinkedBlockingQueue<StreamRecord<T>> queue = sourceContext.getCollectedOutputs();
-        while (allRecords.size() < expectedRecordCount) {
-            StreamRecord<T> record = queue.poll(100, TimeUnit.SECONDS);
-            if (record != null) {
-                allRecords.add(record.getValue());
-            } else {
-                throw new RuntimeException(
-                        "Can't receive " + expectedRecordCount + " elements before timeout.");
-            }
-        }
-
-        return allRecords;
     }
 
     private boolean waitForCheckpointLock(Object checkpointLock, Duration timeout)
@@ -641,34 +670,6 @@ public class OracleSourceTest extends AbstractTestBase {
             Thread.sleep(10); // save CPU
         }
         return !sourceContext.getCollectedOutputs().isEmpty();
-    }
-
-    private static <T> void setupSource(DebeziumSourceFunction<T> source) throws Exception {
-        setupSource(
-                source, false, null, null,
-                true, // enable checkpointing; auto commit should be ignored
-                0, 1);
-    }
-
-    private static <T, S1, S2> void setupSource(
-            DebeziumSourceFunction<T> source,
-            boolean isRestored,
-            ListState<S1> restoredOffsetState,
-            ListState<S2> restoredHistoryState,
-            boolean isCheckpointingEnabled,
-            int subtaskIndex,
-            int totalNumSubtasks)
-            throws Exception {
-
-        // run setup procedure in operator life cycle
-        source.setRuntimeContext(
-                new MockStreamingRuntimeContext(
-                        isCheckpointingEnabled, totalNumSubtasks, subtaskIndex));
-        source.initializeState(
-                new MockFunctionInitializationContext(
-                        isRestored,
-                        new MockOperatorStateStore(restoredOffsetState, restoredHistoryState)));
-        source.open(new Configuration());
     }
 
     /**
@@ -755,6 +756,11 @@ public class OracleSourceTest extends AbstractTestBase {
         @Override
         public boolean isRestored() {
             return isRestored;
+        }
+
+        @Override
+        public OptionalLong getRestoredCheckpointId() {
+            return null;
         }
 
         @Override
